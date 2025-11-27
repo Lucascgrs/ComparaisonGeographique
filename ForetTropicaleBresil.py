@@ -4,226 +4,151 @@
 import os
 import sys
 import argparse
+import shutil
 import requests
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import osmnx as ox
 import shapely.geometry
-import xml.etree.ElementTree as ET
-from io import BytesIO
 from PIL import Image
-import cv2
 from tqdm import tqdm
 import sentinelhub
+import warnings
 
+# Ignorer les warnings géométriques mineurs
+warnings.filterwarnings("ignore")
 
-def display_info(title, data):
-    print(f"\n{'='*60}")
-    print(f"{title}")
-    print(f"{'='*60}")
-    print(data)
-
-
-import mycredentials
+# On essaie d'importer les credentials, sinon on crée un mock
+try:
+    import mycredentials
+except ImportError:
+    print("⚠️ mycredentials.py manquant. Certaines fonctions pourraient échouer.")
+    class mycredentials:
+        username = ""
+        password = ""
 
 # ============================================================================
-# MODULE 1: GÉOGRAPHIE & ZONE D'INTÉRÊT
+# CONSTANTES : LISTE DES ÉTATS DU BRÉSIL (Ordre Prioritaire Déforestation)
+# ============================================================================
+# On commence par l'Amazonie Légale ("Legal Amazon") où se concentre la déforestation
+BRAZIL_STATES = [
+    "Pará, Brazil",
+    "Mato Grosso, Brazil",
+    "Rondônia, Brazil",
+    "Amazonas, Brazil",
+    "Acre, Brazil",
+    "Maranhão, Brazil",
+    "Roraima, Brazil",
+    "Tocantins, Brazil",
+    "Amapá, Brazil",
+    # Autres états (Cerrado / Mata Atlântica)
+    "Goiás, Brazil",
+    "Bahia, Brazil",
+    "Minas Gerais, Brazil",
+    "Mato Grosso do Sul, Brazil",
+    "Piauí, Brazil",
+    "São Paulo, Brazil",
+    "Paraná, Brazil",
+    "Rio Grande do Sul, Brazil",
+    "Santa Catarina, Brazil",
+    "Ceará, Brazil",
+    "Rio de Janeiro, Brazil",
+    "Pernambuco, Brazil",
+    "Espírito Santo, Brazil",
+    "Paraíba, Brazil",
+    "Rio Grande do Norte, Brazil",
+    "Alagoas, Brazil",
+    "Sergipe, Brazil",
+    "Distrito Federal, Brazil"
+]
+
+# ============================================================================
+# MODULE 1: GÉOGRAPHIE & GESTION DE VILLES
 # ============================================================================
 class GeoManager:
-    def __init__(self, place_name="Rio de Janeiro, Brazil"):
-        self.place_name = place_name
+    def __init__(self):
         self.municipalities = None
-        self.aoi = None
-        self.bbox = None
-        self.bbox_polygon = None
-        
-    def fetch_data(self):
-        display_info("GÉOGRAPHIE", f"Récupération des données pour : {self.place_name}")
+        self.current_aoi = None
+        self.current_bbox = None
+        self.current_name = None
+
+    def get_municipalities_list(self, state_name, limit=None):
+        """Récupère la liste des municipalités pour un état donné."""
+        tqdm.write(f"🌍 Récupération des municipalités pour : {state_name}...")
         try:
-            # OPTIMISATION : On utilise geocode_to_gdf qui est beaucoup plus léger
-            # Il ne télécharge que la frontière (polygone), pas les rues ni les bâtiments
-            self.municipalities = ox.geocode_to_gdf(self.place_name)
+            # On récupère les frontières administratives niveau 8 (villes)
+            gdf = ox.features_from_place(
+                state_name,
+                tags={'admin_level': '8', 'boundary': 'administrative'}
+            )
             
-            # On renomme la colonne 'display_name' en 'name' pour garder la compatibilité avec le reste du script
-            if 'display_name' in self.municipalities.columns:
-                self.municipalities['name'] = self.municipalities['display_name']
-                
-            print(f"✅ Frontières récupérées rapidement pour {self.place_name}")
+            if 'name' not in gdf.columns and 'display_name' in gdf.columns:
+                gdf['name'] = gdf['display_name']
+            
+            # Nettoyage
+            gdf = gdf[gdf['name'].notna()]
+            
+            # Tri aléatoire pour ne pas toujours faire les mêmes si on met une limite
+            # ou tri par taille (optionnel), ici on prend les premiers retournés
+            
+            if limit and limit > 0:
+                gdf = gdf.head(limit)
+            
+            self.municipalities = gdf
+            tqdm.write(f"✅ {len(gdf)} municipalités trouvées dans {state_name}.")
+            return gdf['name'].tolist()
             
         except Exception as e:
-            print(f"⚠️ Erreur méthode rapide, tentative méthode complète... ({e})")
-            # Fallback sur l'ancienne méthode si jamais ça échoue
+            tqdm.write(f"❌ Erreur récupération liste {state_name} : {e}")
+            return []
+
+    def set_current_municipality(self, name):
+        """Définit la municipalité active pour l'analyse."""
+        # Si la municipalité est dans le buffer chargé (le cas normal dans la boucle)
+        if self.municipalities is not None and name in self.municipalities['name'].values:
+            self.current_aoi = self.municipalities[self.municipalities['name'] == name].iloc[[0]]
+        else:
+            # Fallback : géocodage direct (pour le deep scan final si besoin)
             try:
-                self.municipalities = ox.features_from_place(
-                    self.place_name,
-                    tags={'admin_level': '8', 'boundary': 'administrative'}
-                )
-            except Exception as e2:
-                print(f"❌ Échec total récupération géo : {e2}")
-                sys.exit(1)
+                gdf = ox.geocode_to_gdf(f"{name}, Brazil")
+                self.current_aoi = gdf.iloc[[0]]
+            except:
+                return False
 
-    def save_map(self, filename="municipalities_map.html"):
-        if self.municipalities is not None:
-            print(f"💾 Sauvegarde de la carte dans {filename}...")
-            m = self.municipalities.explore(column='name', cmap='Set3')
+        self.current_name = name
+        self.current_bbox = self.current_aoi.total_bounds # (minx, miny, maxx, maxy)
+        # Note: SentinelHub gère le bbox en liste, pas besoin de polygone shapely ici
+        return True
+
+    def save_current_map(self, output_dir):
+        """Sauvegarde la carte HTML."""
+        filename = os.path.join(output_dir, "map_location.html")
+        try:
+            m = self.current_aoi.explore(color='red', tiles='OpenStreetMap', style_kwds={'fillOpacity': 0.1})
             m.save(filename)
-
-    def select_municipality(self, search_str):
-        if self.municipalities is None:
-            self.fetch_data()
-            
-        mask = self.municipalities['name'].str.contains(search_str, case=False, na=False)
-        subset = self.municipalities[mask]
-        
-        if subset.empty:
-            raise ValueError(f"Aucune municipalité trouvée avec le nom : {search_str}")
-            
-        self.aoi = subset.iloc[[0]] # Garder en GeoDataFrame
-        muni_name = self.aoi.iloc[0].get('name', 'N/A')
-        print(f"Municipalité sélectionnée : {muni_name}")
-        
-        # Calcul de la BBOX
-        self.bbox = self.aoi.total_bounds # (minx, miny, maxx, maxy)
-        self.bbox_polygon = shapely.geometry.box(*self.bbox)
-        print(f"BBOX : {self.bbox}")
-        return self.aoi
-
-# ============================================================================
-# MODULE 2: COPERNICUS ODATA API (RECHERCHE & TÉLÉCHARGEMENT DIRECT)
-# ============================================================================
-class CopernicusDirect:
-    def __init__(self, bbox_polygon, start_date, end_date, cloud_cover=100.0):
-        self.bbox_polygon = bbox_polygon
-        self.start_date = start_date
-        self.end_date = end_date
-        self.cloud_cover = cloud_cover
-        self.products = pd.DataFrame()
-        self.session = requests.Session()
-
-    def search_products(self):
-        display_info("RECHERCHE SATELLITE", f"Recherche images Sentinel-2 (Nuages < {self.cloud_cover}%)")
-        
-        url = (
-            "https://catalogue.dataspace.copernicus.eu/odata/v1/Products?"
-            "&$filter=Collection/Name eq 'SENTINEL-2'"
-            " and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/OData.CSC.StringAttribute/Value eq 'S2MSI2A')"
-            f" and OData.CSC.Intersects(area=geography'SRID=4326;{self.bbox_polygon}')"
-            f" and ContentDate/Start gt {self.start_date}T00:00:00.000Z"
-            f" and ContentDate/Start lt {self.end_date}T00:00:00.000Z"
-            f" and Attributes/OData.CSC.DoubleAttribute/any(att:att/Name eq 'cloudCover' and att/OData.CSC.DoubleAttribute/Value le {self.cloud_cover})"
-            "&$expand=Assets"
-            "&$expand=Attributes"
-            "&$orderby=ContentDate/Start"
-            "&$top=50"
-        )
-        
-        try:
-            response = requests.get(url).json()
-            if "value" in response:
-                self.products = pd.DataFrame.from_dict(response['value'])
-                print(f"{len(self.products)} images trouvées.")
-            else:
-                print(f"Erreur ou aucun résultat : {response}")
         except Exception as e:
-            print(f"Erreur de requête : {e}")
+            print(f"⚠️ Erreur carte HTML : {e}")
 
-    def authenticate(self):
-        data = {
-            "client_id": "cdse-public",
-            "username": mycredentials.username,
-            "password": mycredentials.password,
-            "grant_type": "password",
-        }
-        try:
-            r = requests.post("https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token", data=data)
-            r.raise_for_status()
-            token = r.json()["access_token"]
-            self.session.headers["Authorization"] = f"Bearer {token}"
-        except Exception as e:
-            print(f"Échec authentification (vérifiez mycredentials.py) : {e}")
-
-    def download_first_product_bands(self, output_dir="."):
-        if self.products.empty:
-            print("Aucun produit à télécharger.")
-            return
-
-        product = self.products.iloc[0]
-        pid = product['Id']
-        pname = product['Name']
-        print(f"⬇️ Téléchargement pour le produit : {pname}")
-
-        # 1. Télécharger Manifeste
-        manifest_path = os.path.join(output_dir, "Manifest.xml")
-        self._download_file(f"https://catalogue.dataspace.copernicus.eu/odata/v1/Products({pid})/Nodes({pname})/Nodes(MTD_MSIL2A.xml)/$value", manifest_path)
-
-        # 2. Parser Manifeste pour trouver les bandes
-        bands_to_download = self._parse_manifest(manifest_path)
-        
-        # 3. Télécharger les bandes
-        downloaded_files = []
-        for band_path in bands_to_download:
-            # Construction URL complexe (simplifiée ici selon logique notebook)
-            parts = band_path.split("/") # Structure typique Sentinel
-            node_url = f"https://catalogue.dataspace.copernicus.eu/odata/v1/Products({pid})/Nodes({pname})"
-            for p in parts:
-                node_url += f"/Nodes({p})"
-            node_url += "/$value"
-            
-            filename = parts[-1]
-            filepath = os.path.join(output_dir, filename)
-            self._download_file(node_url, filepath)
-            downloaded_files.append(filepath)
-            
-        return downloaded_files
-
-    def _download_file(self, url, save_path):
-        # Gestion des redirections manuelle comme dans le notebook
-        response = self.session.get(url, allow_redirects=False)
-        while response.status_code in (301, 302, 303, 307):
-            url = response.headers["Location"]
-            response = self.session.get(url, allow_redirects=False)
-        
-        response = self.session.get(url, verify=False, allow_redirects=True, stream=True)
-        total_size = int(response.headers.get("content-length", 0))
-        
-        print(f"   💾 {os.path.basename(save_path)}")
-        with tqdm(total=total_size, unit="B", unit_scale=True) as pbar:
-            with open(save_path, "wb") as f:
-                for chunk in response.iter_content(1024):
-                    f.write(chunk)
-                    pbar.update(len(chunk))
-
-    def _parse_manifest(self, manifest_path):
-        # Logique extraite du notebook pour filtrer 20m et bandes spécifiques
-        desired_channels = ["B02", "B03", "B04", "B8A"]
-        gsd = "20m"
-        band_locations = []
-        tree = ET.parse(manifest_path)
-        root = tree.getroot()
-        ns = {'ns': 'https://psd-14.sentinel2.eo.esa.int/PSD/User_Product_Level-2A.xsd'} # Namespace peut varier
-        
-        # Recherche simple via itération pour éviter les soucis de namespace complexes
-        for elem in root.iter():
-            if elem.text and gsd in elem.text and any(ch in elem.text for ch in desired_channels):
-                if elem.text.endswith('.jp2'): # Sécurité
-                    band_locations.append(f"{elem.text}")
-                else:
-                    band_locations.append(f"{elem.text}.jp2")
-        return list(set(band_locations)) # Uniques
 
 # ============================================================================
-# MODULE 3: SENTINEL HUB (PROCESSUS COMPARATIF)
+# MODULE 2: SENTINEL HUB (ANALYSE)
 # ============================================================================
 class SentinelHubProcessor:
-    def __init__(self, bbox, resolution=200):
-        self.bbox_list = bbox
-        self.resolution = resolution
-        # Configuration SentinelHub
-        self.config = sentinelhub.SHConfig("cdse") # Profil par défaut 'cdse'
+    def __init__(self, bbox, resolution=500):
+        self.config = sentinelhub.SHConfig("cdse")
         self.aoi_bbox_sh = sentinelhub.BBox(bbox=list(bbox), crs=sentinelhub.CRS.WGS84)
-        self.aoi_size = sentinelhub.bbox_to_dimensions(self.aoi_bbox_sh, resolution=resolution)
-        print(f"📐 Taille image cible : {self.aoi_size} pixels")
+        
+        # Calcul dynamique taille image
+        try:
+            self.aoi_size = sentinelhub.bbox_to_dimensions(self.aoi_bbox_sh, resolution=resolution)
+            # Sécurité taille max (SentinelHub bloque souvent > 2500px en free tier/standard)
+            max_px = 2500
+            if max(self.aoi_size) > max_px:
+                scale = max_px / max(self.aoi_size)
+                self.aoi_size = (int(self.aoi_size[0] * scale), int(self.aoi_size[1] * scale))
+        except:
+            self.aoi_size = (100, 100)
 
     def get_image(self, evalscript, start_date, end_date, brightness=1.0, filename=None):
         request = sentinelhub.SentinelHubRequest(
@@ -243,26 +168,25 @@ class SentinelHubProcessor:
             config=self.config,
         )
         
-        data = request.get_data()
-        if not data:
-            print("⚠️ Aucune donnée reçue.")
+        try:
+            data = request.get_data()
+            if not data: return None
+            img_array = data[0]
+            
+            if brightness != 1.0:
+                img_array = np.uint8((img_array * brightness).clip(0, 255))
+                
+            if filename:
+                to_save = img_array if img_array.shape[-1] != 1 else img_array.squeeze()
+                Image.fromarray(to_save).save(filename)
+                
+            return img_array
+        except Exception as e:
+            # tqdm.write(f"⚠️ Erreur SH : {e}")
             return None
 
-        img_array = data[0]
-        
-        # Ajustement luminosité
-        if brightness != 1.0:
-            img_array = np.uint8((img_array * brightness).clip(0, 255))
-            
-        # Sauvegarde
-        if filename:
-            Image.fromarray(img_array if img_array.shape[-1] != 1 else img_array.squeeze()).save(filename)
-            print(f"💾 Image sauvegardée : {filename}")
-            
-        return img_array
-
 # ============================================================================
-# SCRIPTS D'ÉVALUATION (EVALSCRIPTS)
+# EVALSCRIPTS
 # ============================================================================
 EVALSCRIPTS = {
     "TRUE_COLOR": """
@@ -270,107 +194,155 @@ EVALSCRIPTS = {
         function setup() { return { input: [{ bands: ["B02", "B03", "B04"] }], output: { bands: 3 } }; }
         function evaluatePixel(sample) { return [sample.B04, sample.B03, sample.B02]; }
     """,
-    "FALSE_COLOR": """
-        //VERSION=3
-        function setup() { return { input: [{ bands: ["B03", "B04", "B08"] }], output: { bands: 3 } }; }
-        function evaluatePixel(sample) { return [sample.B08, sample.B04, sample.B03]; }
-    """,
     "NDVI": """
         //VERSION=3
-        function setup() { return { input: [{ bands: ["B04", "B08", "dataMask"] }], output: { bands: 4 } }; }
+        function setup() { return { input: [{ bands: ["B04", "B08"] }], output: { bands: 4 } }; }
         const whiteGreen = [[1.0, 0xFFFFFF], [0.5, 0x000000], [0.0, 0x00FF00]];
         let viz = new ColorGradientVisualizer(whiteGreen, -1.0, 1.0);
         function evaluatePixel(samples) {
             let val = ((samples.B08 + samples.B04)==0) ? 0 : ((samples.B08 - samples.B04) / (samples.B08 + samples.B04));
-            let col = viz.process(val);
-            col.push(samples.dataMask);
-            return col;
+            let col = viz.process(val); col.push(255); return col;
         }
     """,
     "BURNED_INDEX_RAW": """
         //VERSION=3
-        function setup() { return { input: [{ bands: ["B08", "B12", "dataMask"] }], output: { bands: 1, sampleType: SampleType.FLOAT32 } }; }
+        function setup() { return { input: [{ bands: ["B08", "B12"] }], output: { bands: 1, sampleType: SampleType.FLOAT32 } }; }
         function evaluatePixel(samples) {
-            let val = ((samples.B08 + samples.B12)==0) ? 0 : ((samples.B08 - samples.B12) / (samples.B08 + samples.B12));
-            return [val];
+            return [((samples.B08 + samples.B12)==0) ? 0 : ((samples.B08 - samples.B12) / (samples.B08 + samples.B12))];
         }
     """
 }
 
 # ============================================================================
-# MAIN
+# CORE LOGIC
 # ============================================================================
 
+def analyze_municipality(geo, name, args, is_deep_scan=False):
+    """Retourne un score de déforestation (0-100). Génère des fichiers si is_deep_scan=True."""
+    try:
+        if not geo.set_current_municipality(name):
+            return 0
+
+        # Dossier de sortie (seulement pour le deep scan)
+        output_dir = None
+        if is_deep_scan:
+            clean_name = name.replace(" ", "_").replace(",", "")
+            output_dir = os.path.join("results", clean_name)
+            os.makedirs(output_dir, exist_ok=True)
+            geo.save_current_map(output_dir)
+            tqdm.write(f"📂 Génération rapport pour {name}...")
+
+        # Résolution adaptative
+        res = args.resolution if is_deep_scan else args.scan_resolution
+        sh_proc = SentinelHubProcessor(geo.current_bbox, resolution=res)
+        
+        interval_before = (f"{args.year_before}-07-01", f"{args.year_before}-09-30")
+        interval_after = (f"{args.year_after}-07-01", f"{args.year_after}-09-30")
+
+        # 1. Calcul Score (Burn Index)
+        raw_before = sh_proc.get_image(EVALSCRIPTS["BURNED_INDEX_RAW"], *interval_before)
+        raw_after = sh_proc.get_image(EVALSCRIPTS["BURNED_INDEX_RAW"], *interval_after)
+
+        score = 0
+        if raw_before is not None and raw_after is not None:
+            difference = raw_before - raw_after
+            # On compte les pixels > seuil (0.2)
+            affected_pixels = np.sum(difference > 0.25)
+            total_pixels = difference.size
+            score = (affected_pixels / total_pixels) * 100
+        else:
+            return 0
+
+        if not is_deep_scan:
+            return score
+
+        # 2. Génération Deep Scan
+        Image.fromarray(raw_before if raw_before.shape[-1] != 1 else raw_before.squeeze()).save(os.path.join(output_dir, "burn_raw_before.tif"))
+        
+        img_after = sh_proc.get_image(EVALSCRIPTS["TRUE_COLOR"], *interval_after, brightness=3.5, filename=os.path.join(output_dir, "true_color_after.png"))
+        sh_proc.get_image(EVALSCRIPTS["TRUE_COLOR"], *interval_before, brightness=3.5, filename=os.path.join(output_dir, "true_color_before.png"))
+        
+        sh_proc.get_image(EVALSCRIPTS["NDVI"], *interval_before, filename=os.path.join(output_dir, "ndvi_before.png"))
+        sh_proc.get_image(EVALSCRIPTS["NDVI"], *interval_after, filename=os.path.join(output_dir, "ndvi_after.png"))
+
+        # Composite
+        if img_after is not None and raw_before is not None and raw_after is not None:
+            composite = np.array(img_after)
+            diff = raw_before - raw_after
+            if diff.shape[:2] == composite.shape[:2]:
+                composite[diff > 0.25] = [255, 128, 0]
+                composite[diff > 0.60] = [255, 0, 0]
+                Image.fromarray(composite).save(os.path.join(output_dir, "analysis_composite.png"))
+
+        return score
+
+    except Exception as e:
+        # tqdm.write(f"Erreur {name}: {e}")
+        return 0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Outil de surveillance forestière Sentinel-2")
-    parser.add_argument("--city", type=str, default="Lábrea, Brazil", help="Nom de la municipalité (ex: 'Novo Progresso, Brazil')")
-    parser.add_argument("--cloud", type=float, default=10.0, help="Pourcentage maximum de nuages")
-    parser.add_argument("--start", type=str, default="2019-07-01", help="Date début (YYYY-MM-DD)")
-    parser.add_argument("--end", type=str, default="2019-09-30", help="Date fin (YYYY-MM-DD)")
-    parser.add_argument("--compare_year_before", type=str, default="2018", help="Année 'Avant' pour comparaison")
-    parser.add_argument("--compare_year_after", type=str, default="2021", help="Année 'Après' pour comparaison")
+    parser = argparse.ArgumentParser(description="Scanner National de Déforestation - Brésil")
+    parser.add_argument("--max_states", type=int, default=1, help="Nombre d'états à scanner (dans l'ordre prioritaire)")
+    parser.add_argument("--limit_per_state", type=int, default=5, help="Nombre de villes à scanner par état")
+    parser.add_argument("--top_n", type=int, default=2, help="Top N final des pires villes à analyser en détail")
+    
+    parser.add_argument("--year_before", type=str, default="2018")
+    parser.add_argument("--year_after", type=str, default="2021")
+    parser.add_argument("--scan_resolution", type=int, default=1000, help="Résolution du scan (m)")
+    parser.add_argument("--resolution", type=int, default=200, help="Résolution du deep scan (m)")
     
     args = parser.parse_args()
 
-    # --- CORRECTION ICI ---
-    # On initialise GeoManager avec la ville demandée, et pas Rio par défaut
-    geo = GeoManager(place_name=args.city)
+    # Sélection des états
+    states_to_scan = BRAZIL_STATES[:args.max_states]
     
-    # Pour la recherche, on prend juste le nom de la ville avant la virgule si présent
-    # Ex: "Novo Progresso, Brazil" -> recherche "Novo Progresso" dans le résultat
-    search_name = args.city.split(",")[0]
-    geo.select_municipality(search_name)
-    # ----------------------
+    print(f"🚀 DÉMARRAGE DU SCAN GLOBAL ({args.year_before} -> {args.year_after})")
+    print(f"📍 États ciblés ({len(states_to_scan)}): {', '.join([s.split(',')[0] for s in states_to_scan])}")
+    print(f"⚡ Résolution scan: {args.scan_resolution}m | Limite: {args.limit_per_state} villes/état")
+    print("="*60)
 
-    geo.save_map(f"map_{search_name.replace(' ', '_')}.html")
+    geo = GeoManager()
+    global_scores = {}
 
-    # 2. Recherche API (Mode Découverte)
-    copernicus = CopernicusDirect(geo.bbox_polygon, args.start, args.end, args.cloud)
-    copernicus.search_products()
+    # --- BOUCLE SUR LES ÉTATS ---
+    for state_name in states_to_scan:
+        muni_list = geo.get_municipalities_list(state_name, limit=args.limit_per_state)
+        
+        if not muni_list:
+            continue
+            
+        print(f"   🔍 Analyse de {len(muni_list)} villes dans {state_name}...")
+        
+        # Barre de progression par état
+        for name in tqdm(muni_list, desc=f"Scan {state_name.split(',')[0]}", leave=False):
+            score = analyze_municipality(geo, name, args, is_deep_scan=False)
+            
+            # On garde le score s'il est pertinent
+            if score > 0:
+                global_scores[name] = score
+                # Affichage dynamique des "gros" cas
+                if score > 2.0:
+                    tqdm.write(f"      ⚠️  Alert: {name} -> Score: {score:.2f}")
+
+    # --- RÉSULTATS GLOBAUX ---
+    sorted_scores = sorted(global_scores.items(), key=lambda x: x[1], reverse=True)
     
-    # 3. Analyse SentinelHub
-    if 'sentinelhub' in sys.modules:
-        try:
-            sh_proc = SentinelHubProcessor(geo.bbox, resolution=210) # Resolution ajustée
-            
-            interval_before = (f"{args.compare_year_before}-07-01", f"{args.compare_year_before}-09-30")
-            interval_after = (f"{args.compare_year_after}-07-01", f"{args.compare_year_after}-09-30")
-            
-            print(f"\n🔄 Génération des images comparatives ({args.compare_year_before} vs {args.compare_year_after})...")
+    print("\n" + "="*60)
+    print(f"🏆 CLASSEMENT NATIONAL (TOP 20) - Score de changement")
+    print("="*60)
+    for i, (name, score) in enumerate(sorted_scores[:20]):
+        print(f"{i+1}. {name:<30} : {score:.2f}")
 
-            # True Color
-            img_after = sh_proc.get_image(EVALSCRIPTS["TRUE_COLOR"], *interval_after, brightness=3.5, filename="true_color_after.png")
-            sh_proc.get_image(EVALSCRIPTS["TRUE_COLOR"], *interval_before, brightness=3.5, filename="true_color_before.png")
-
-            # NDVI
-            sh_proc.get_image(EVALSCRIPTS["NDVI"], *interval_before, filename="ndvi_before.png")
-            sh_proc.get_image(EVALSCRIPTS["NDVI"], *interval_after, filename="ndvi_after.png")
-
-            # Burn Index
-            raw_before = sh_proc.get_image(EVALSCRIPTS["BURNED_INDEX_RAW"], *interval_before, filename="burned_raw_before.tif")
-            raw_after = sh_proc.get_image(EVALSCRIPTS["BURNED_INDEX_RAW"], *interval_after, filename="burned_raw_after.tif")
-            
-            if raw_before is not None and raw_after is not None:
-                print("\n🔥 Calcul de la différence des surfaces brûlées...")
-                difference = raw_before - raw_after
-                
-                if img_after is not None:
-                    composite = np.array(img_after)
-                    # Masque rouge pour les zones brûlées
-                    # On redimensionne le masque pour être sûr qu'il colle à l'image (sécurité)
-                    if difference.shape[:2] == composite.shape[:2]:
-                        composite[difference > 0.27] = [255, 128, 0]
-                        composite[difference > 0.66] = [255, 0, 0]
-                    
-                    Image.fromarray(composite).save('burn_composite_analysis.png')
-                    print("✅ Image composite sauvegardée : burn_composite_analysis.png")
-
-        except Exception as e:
-            print(f"❌ Erreur Sentinel Hub : {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print("Module SentinelHub manquant, analyse ignorée.")
+    # --- DEEP SCAN FINAL ---
+    print("\n" + "="*60)
+    print(f"🔬 GÉNÉRATION DES RAPPORTS DÉTAILLÉS (TOP {args.top_n})")
+    print("="*60)
+    
+    for name, score in sorted_scores[:args.top_n]:
+        analyze_municipality(geo, name, args, is_deep_scan=True)
+    
+    print(f"\n✅ Analyse terminée. Voir le dossier 'results/'.")
 
 if __name__ == "__main__":
     main()

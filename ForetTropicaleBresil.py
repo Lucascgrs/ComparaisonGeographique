@@ -16,55 +16,24 @@ from tqdm import tqdm
 import sentinelhub
 import warnings
 
-# Ignorer les warnings géométriques mineurs
 warnings.filterwarnings("ignore")
 
-# On essaie d'importer les credentials, sinon on crée un mock
 try:
     import mycredentials
 except ImportError:
-    print("⚠️ mycredentials.py manquant. Certaines fonctions pourraient échouer.")
-    class mycredentials:
-        username = ""
-        password = ""
+    print("⚠️ mycredentials.py manquant.")
 
 # ============================================================================
-# CONSTANTES : LISTE DES ÉTATS DU BRÉSIL (Ordre Prioritaire Déforestation)
+# CONSTANTES
 # ============================================================================
-# On commence par l'Amazonie Légale ("Legal Amazon") où se concentre la déforestation
 BRAZIL_STATES = [
-    "Pará, Brazil",
-    "Mato Grosso, Brazil",
-    "Rondônia, Brazil",
-    "Amazonas, Brazil",
-    "Acre, Brazil",
-    "Maranhão, Brazil",
-    "Roraima, Brazil",
-    "Tocantins, Brazil",
-    "Amapá, Brazil",
-    # Autres états (Cerrado / Mata Atlântica)
-    "Goiás, Brazil",
-    "Bahia, Brazil",
-    "Minas Gerais, Brazil",
-    "Mato Grosso do Sul, Brazil",
-    "Piauí, Brazil",
-    "São Paulo, Brazil",
-    "Paraná, Brazil",
-    "Rio Grande do Sul, Brazil",
-    "Santa Catarina, Brazil",
-    "Ceará, Brazil",
-    "Rio de Janeiro, Brazil",
-    "Pernambuco, Brazil",
-    "Espírito Santo, Brazil",
-    "Paraíba, Brazil",
-    "Rio Grande do Norte, Brazil",
-    "Alagoas, Brazil",
-    "Sergipe, Brazil",
-    "Distrito Federal, Brazil"
+    "Pará, Brazil", "Mato Grosso, Brazil", "Rondônia, Brazil", 
+    "Amazonas, Brazil", "Acre, Brazil", "Maranhão, Brazil", 
+    "Roraima, Brazil", "Tocantins, Brazil", "Amapá, Brazil"
 ]
 
 # ============================================================================
-# MODULE 1: GÉOGRAPHIE & GESTION DE VILLES
+# MODULE GÉOGRAPHIE (OPTIMISÉ IBGE)
 # ============================================================================
 class GeoManager:
     def __init__(self):
@@ -72,122 +41,142 @@ class GeoManager:
         self.current_aoi = None
         self.current_bbox = None
         self.current_name = None
+        
+        # Codes des états pour l'API IBGE
+        self.ibge_codes = {
+            "Rondônia": 11, "Acre": 12, "Amazonas": 13, "Roraima": 14,
+            "Pará": 15, "Amapá": 16, "Tocantins": 17, "Maranhão": 21,
+            "Piauí": 22, "Ceará": 23, "Rio Grande do Norte": 24, "Paraíba": 25,
+            "Pernambuco": 26, "Alagoas": 27, "Sergipe": 28, "Bahia": 29,
+            "Minas Gerais": 31, "Espírito Santo": 32, "Rio de Janeiro": 33,
+            "São Paulo": 35, "Paraná": 41, "Santa Catarina": 42,
+            "Rio Grande do Sul": 43, "Mato Grosso do Sul": 50,
+            "Mato Grosso": 51, "Goiás": 52, "Distrito Federal": 53
+        }
 
-    def get_municipalities_list(self, state_name, limit=None):
-        """Récupère la liste des municipalités pour un état donné."""
-        tqdm.write(f"🌍 Récupération des municipalités pour : {state_name}...")
+    def get_municipalities_list(self, state_full_name, limit=None):
+        """Récupère la liste via l'API IBGE (Version Tolérante)"""
+        state_name = state_full_name.split(",")[0].strip()
+        tqdm.write(f"🌍 Récupération IBGE pour : {state_name}...")
+        
+        code = self.ibge_codes.get(state_name)
+        if not code: return []
+
         try:
-            # On récupère les frontières administratives niveau 8 (villes)
-            gdf = ox.features_from_place(
-                state_name,
-                tags={'admin_level': '8', 'boundary': 'administrative'}
-            )
+            url = f"https://servicodados.ibge.gov.br/api/v2/malhas/{code}/?resolucao=5&formato=application/vnd.geo+json"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            r = requests.get(url, headers=headers)
+            r.raise_for_status()
             
-            if 'name' not in gdf.columns and 'display_name' in gdf.columns:
-                gdf['name'] = gdf['display_name']
+            from io import BytesIO
+            gdf = gpd.read_file(BytesIO(r.content))
             
-            # Nettoyage
-            gdf = gdf[gdf['name'].notna()]
+            # DEBUG : Afficher les colonnes reçues si ça plante
+            # print(f"DEBUG Colonnes reçues : {gdf.columns.tolist()}")
             
-            # Tri aléatoire pour ne pas toujours faire les mêmes si on met une limite
-            # ou tri par taille (optionnel), ici on prend les premiers retournés
+            # Logique floue pour trouver le nom de la ville
+            col_name = None
+            candidates = ['NM_MUN', 'name', 'nam', 'nom', 'nome', 'municipio']
             
-            if limit and limit > 0:
+            # 1. On cherche une colonne connue
+            for c in candidates:
+                if c in gdf.columns:
+                    col_name = c
+                    break
+            
+            # 2. Si on trouve pas, on prend la première colonne de type 'object' (texte) qui n'est pas 'geometry'
+            if not col_name:
+                for col in gdf.columns:
+                    if col != 'geometry' and gdf[col].dtype == 'object':
+                        col_name = col
+                        break
+            
+            if not col_name:
+                tqdm.write(f"❌ Impossible de trouver la colonne 'Nom de ville' dans : {gdf.columns.tolist()}")
+                return []
+
+            # On renomme la colonne trouvée en 'name' pour tout le reste du script
+            gdf['name'] = gdf[col_name].astype(str) + ", Brazil"
+            
+            if limit and limit > 0: 
                 gdf = gdf.head(limit)
             
             self.municipalities = gdf
-            tqdm.write(f"✅ {len(gdf)} municipalités trouvées dans {state_name}.")
+            tqdm.write(f"✅ {len(gdf)} municipalités chargées.")
             return gdf['name'].tolist()
             
         except Exception as e:
-            tqdm.write(f"❌ Erreur récupération liste {state_name} : {e}")
+            tqdm.write(f"❌ Erreur IBGE : {e}")
             return []
 
     def set_current_municipality(self, name):
-        """Définit la municipalité active pour l'analyse."""
-        # Si la municipalité est dans le buffer chargé (le cas normal dans la boucle)
+        # Si on a chargé via IBGE, c'est immédiat
         if self.municipalities is not None and name in self.municipalities['name'].values:
             self.current_aoi = self.municipalities[self.municipalities['name'] == name].iloc[[0]]
+            # Conversion CRS si nécessaire (IBGE est souvent en SIRGAS 2000 / EPSG:4674)
+            if self.current_aoi.crs != "EPSG:4326":
+                self.current_aoi = self.current_aoi.to_crs("EPSG:4326")
         else:
-            # Fallback : géocodage direct (pour le deep scan final si besoin)
+            # Fallback OSM si jamais
             try:
-                gdf = ox.geocode_to_gdf(f"{name}, Brazil")
+                gdf = ox.geocode_to_gdf(name)
                 self.current_aoi = gdf.iloc[[0]]
-            except:
-                return False
-
+            except: return False
+            
         self.current_name = name
-        self.current_bbox = self.current_aoi.total_bounds # (minx, miny, maxx, maxy)
-        # Note: SentinelHub gère le bbox en liste, pas besoin de polygone shapely ici
+        self.current_bbox = self.current_aoi.total_bounds
         return True
 
     def save_current_map(self, output_dir):
-        """Sauvegarde la carte HTML."""
         filename = os.path.join(output_dir, "map_location.html")
         try:
             m = self.current_aoi.explore(color='red', tiles='OpenStreetMap', style_kwds={'fillOpacity': 0.1})
             m.save(filename)
-        except Exception as e:
-            print(f"⚠️ Erreur carte HTML : {e}")
-
+        except: pass
 
 # ============================================================================
-# MODULE 2: SENTINEL HUB (ANALYSE)
+# SENTINEL HUB (AUTHENTIFIÉ AVEC CREDENTIALS)
 # ============================================================================
 class SentinelHubProcessor:
     def __init__(self, bbox, resolution=500):
-        self.config = sentinelhub.SHConfig("cdse")
-        self.aoi_bbox_sh = sentinelhub.BBox(bbox=list(bbox), crs=sentinelhub.CRS.WGS84)
+        # ICI : On configure SentinelHub avec tes clés explicites
+        self.config = sentinelhub.SHConfig()
+        self.config.sh_client_id = mycredentials.client_id
+        self.config.sh_client_secret = mycredentials.client_secret
+        self.config.sh_base_url = "https://sh.dataspace.copernicus.eu"
+        self.config.sh_token_url = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
         
-        # Calcul dynamique taille image
+        self.aoi_bbox_sh = sentinelhub.BBox(bbox=list(bbox), crs=sentinelhub.CRS.WGS84)
         try:
             self.aoi_size = sentinelhub.bbox_to_dimensions(self.aoi_bbox_sh, resolution=resolution)
-            # Sécurité taille max (SentinelHub bloque souvent > 2500px en free tier/standard)
             max_px = 2500
             if max(self.aoi_size) > max_px:
                 scale = max_px / max(self.aoi_size)
                 self.aoi_size = (int(self.aoi_size[0] * scale), int(self.aoi_size[1] * scale))
-        except:
-            self.aoi_size = (100, 100)
+        except: self.aoi_size = (100, 100)
 
     def get_image(self, evalscript, start_date, end_date, brightness=1.0, filename=None):
         request = sentinelhub.SentinelHubRequest(
             evalscript=evalscript,
-            input_data=[
-                sentinelhub.SentinelHubRequest.input_data(
-                    data_collection=sentinelhub.DataCollection.SENTINEL2_L2A.define_from(
-                        name="s2", service_url="https://sh.dataspace.copernicus.eu"
-                    ),
-                    time_interval=(start_date, end_date),
-                    other_args={"dataFilter": {"mosaickingOrder": "leastCC"}}
-                )
-            ],
+            input_data=[sentinelhub.SentinelHubRequest.input_data(
+                data_collection=sentinelhub.DataCollection.SENTINEL2_L2A.define_from(name="s2", service_url="https://sh.dataspace.copernicus.eu"),
+                time_interval=(start_date, end_date),
+                other_args={"dataFilter": {"mosaickingOrder": "leastCC"}}
+            )],
             responses=[sentinelhub.SentinelHubRequest.output_response("default", sentinelhub.MimeType.TIFF)],
-            bbox=self.aoi_bbox_sh,
-            size=self.aoi_size,
-            config=self.config,
+            bbox=self.aoi_bbox_sh, size=self.aoi_size, config=self.config
         )
-        
         try:
             data = request.get_data()
             if not data: return None
             img_array = data[0]
-            
-            if brightness != 1.0:
-                img_array = np.uint8((img_array * brightness).clip(0, 255))
-                
+            if brightness != 1.0: img_array = np.uint8((img_array * brightness).clip(0, 255))
             if filename:
                 to_save = img_array if img_array.shape[-1] != 1 else img_array.squeeze()
                 Image.fromarray(to_save).save(filename)
-                
             return img_array
-        except Exception as e:
-            # tqdm.write(f"⚠️ Erreur SH : {e}")
-            return None
+        except: return None
 
-# ============================================================================
-# EVALSCRIPTS
-# ============================================================================
 EVALSCRIPTS = {
     "TRUE_COLOR": """
         //VERSION=3
@@ -214,59 +203,58 @@ EVALSCRIPTS = {
 }
 
 # ============================================================================
-# CORE LOGIC
+# LOGIQUE PRINCIPALE
 # ============================================================================
 
-def analyze_municipality(geo, name, args, is_deep_scan=False):
-    """Retourne un score de déforestation (0-100). Génère des fichiers si is_deep_scan=True."""
+def analyze_municipality_year(geo, name, year_start, year_end, args, is_deep_scan=False):
+    """Analyse une paire d'années spécifique pour une ville."""
     try:
-        if not geo.set_current_municipality(name):
-            return 0
+        if not geo.set_current_municipality(name): return 0
 
-        # Dossier de sortie (seulement pour le deep scan)
+        # Dossier spécifique : Nom_Ville / 2019-2020
+        clean_name = name.replace(" ", "_").replace(",", "")
+        period_name = f"{year_start}-{year_end}"
         output_dir = None
+        
         if is_deep_scan:
-            clean_name = name.replace(" ", "_").replace(",", "")
-            output_dir = os.path.join("results", clean_name)
+            output_dir = os.path.join("results", clean_name, period_name)
             os.makedirs(output_dir, exist_ok=True)
-            geo.save_current_map(output_dir)
-            tqdm.write(f"📂 Génération rapport pour {name}...")
+            # On sauve la carte à la racine de la ville (une seule fois suffit)
+            geo.save_current_map(os.path.join("results", clean_name))
+            tqdm.write(f"   📸 Deep Scan: {name} ({period_name})")
 
-        # Résolution adaptative
         res = args.resolution if is_deep_scan else args.scan_resolution
         sh_proc = SentinelHubProcessor(geo.current_bbox, resolution=res)
         
-        interval_before = (f"{args.year_before}-07-01", f"{args.year_before}-09-30")
-        interval_after = (f"{args.year_after}-07-01", f"{args.year_after}-09-30")
+        # Période sèche (Juillet-Septembre)
+        interval_before = (f"{year_start}-07-01", f"{year_start}-09-30")
+        interval_after = (f"{year_end}-07-01", f"{year_end}-09-30")
 
-        # 1. Calcul Score (Burn Index)
+        # 1. Calcul Score
         raw_before = sh_proc.get_image(EVALSCRIPTS["BURNED_INDEX_RAW"], *interval_before)
         raw_after = sh_proc.get_image(EVALSCRIPTS["BURNED_INDEX_RAW"], *interval_after)
 
         score = 0
         if raw_before is not None and raw_after is not None:
-            difference = raw_before - raw_after
-            # On compte les pixels > seuil (0.2)
-            affected_pixels = np.sum(difference > 0.25)
-            total_pixels = difference.size
-            score = (affected_pixels / total_pixels) * 100
+            diff = raw_before - raw_after
+            score = (np.sum(diff > 0.25) / diff.size) * 100
         else:
             return 0
 
-        if not is_deep_scan:
-            return score
+        if not is_deep_scan: return score
 
-        # 2. Génération Deep Scan
-        Image.fromarray(raw_before if raw_before.shape[-1] != 1 else raw_before.squeeze()).save(os.path.join(output_dir, "burn_raw_before.tif"))
+        # 2. Génération Images (Seulement Deep Scan)
+        # Sauvegarde RAW pour analyse scientifique
+        Image.fromarray(raw_before.squeeze()).save(os.path.join(output_dir, "burn_raw_before.tif"))
         
+        # Images Visuelles
         img_after = sh_proc.get_image(EVALSCRIPTS["TRUE_COLOR"], *interval_after, brightness=3.5, filename=os.path.join(output_dir, "true_color_after.png"))
         sh_proc.get_image(EVALSCRIPTS["TRUE_COLOR"], *interval_before, brightness=3.5, filename=os.path.join(output_dir, "true_color_before.png"))
-        
         sh_proc.get_image(EVALSCRIPTS["NDVI"], *interval_before, filename=os.path.join(output_dir, "ndvi_before.png"))
         sh_proc.get_image(EVALSCRIPTS["NDVI"], *interval_after, filename=os.path.join(output_dir, "ndvi_after.png"))
 
         # Composite
-        if img_after is not None and raw_before is not None and raw_after is not None:
+        if img_after is not None:
             composite = np.array(img_after)
             diff = raw_before - raw_after
             if diff.shape[:2] == composite.shape[:2]:
@@ -277,72 +265,96 @@ def analyze_municipality(geo, name, args, is_deep_scan=False):
         return score
 
     except Exception as e:
-        # tqdm.write(f"Erreur {name}: {e}")
         return 0
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Scanner National de Déforestation - Brésil")
-    parser.add_argument("--max_states", type=int, default=1, help="Nombre d'états à scanner (dans l'ordre prioritaire)")
-    parser.add_argument("--limit_per_state", type=int, default=5, help="Nombre de villes à scanner par état")
-    parser.add_argument("--top_n", type=int, default=2, help="Top N final des pires villes à analyser en détail")
-    
-    parser.add_argument("--year_before", type=str, default="2018")
-    parser.add_argument("--year_after", type=str, default="2021")
-    parser.add_argument("--scan_resolution", type=int, default=1000, help="Résolution du scan (m)")
-    parser.add_argument("--resolution", type=int, default=200, help="Résolution du deep scan (m)")
-    
+    parser = argparse.ArgumentParser(description="Time Machine Déforestation")
+    parser.add_argument("--max_states", type=int, default=1)
+    parser.add_argument("--limit_per_state", type=int, default=1)
+    parser.add_argument("--top_n", type=int, default=1, help="Nombre de cas critiques à générer")
+    parser.add_argument("--start_year", type=int, default=2021)
+    parser.add_argument("--end_year", type=int, default=2022)
+    parser.add_argument("--scan_resolution", type=int, default=1000)
+    parser.add_argument("--resolution", type=int, default=210)
     args = parser.parse_args()
 
-    # Sélection des états
-    states_to_scan = BRAZIL_STATES[:args.max_states]
+    # Génération des intervalles (ex: 2018-2019, 2019-2020...)
+    years_intervals = [(y, y+1) for y in range(args.start_year, args.end_year)]
+    columns = ["Municipality", "State"] + [f"{y1}-{y2}" for y1, y2 in years_intervals] + ["Max_Score", "Worst_Year"]
     
-    print(f"🚀 DÉMARRAGE DU SCAN GLOBAL ({args.year_before} -> {args.year_after})")
-    print(f"📍 États ciblés ({len(states_to_scan)}): {', '.join([s.split(',')[0] for s in states_to_scan])}")
-    print(f"⚡ Résolution scan: {args.scan_resolution}m | Limite: {args.limit_per_state} villes/état")
-    print("="*60)
+    results_data = [] # Liste pour le DataFrame final
+    critical_cases = [] # Liste des (Ville, Année, Score) pour le deep scan
 
+    states = BRAZIL_STATES[:args.max_states]
     geo = GeoManager()
-    global_scores = {}
 
-    # --- BOUCLE SUR LES ÉTATS ---
-    for state_name in states_to_scan:
-        muni_list = geo.get_municipalities_list(state_name, limit=args.limit_per_state)
-        
-        if not muni_list:
-            continue
+    print(f"🚀 TIME MACHINE INITIALISÉE ({args.start_year} -> {args.end_year})")
+    print(f"📊 États: {len(states)} | Intervalles: {len(years_intervals)}")
+
+    for state in states:
+        cities = geo.get_municipalities_list(state, limit=args.limit_per_state)
+        if not cities: continue
+
+        # Barre de progression des villes
+        pbar = tqdm(cities, desc=f"Scan {state.split(',')[0]}")
+        for city in pbar:
+            row = {"Municipality": city, "State": state}
+            max_city_score = 0
+            worst_interval = None
+
+            # Analyse Temporelle
+            for y1, y2 in years_intervals:
+                score = analyze_municipality_year(geo, city, y1, y2, args, is_deep_scan=False)
+                col_name = f"{y1}-{y2}"
+                row[col_name] = round(score, 2)
+
+                # Tracking du pire moment
+                if score > max_city_score:
+                    max_city_score = score
+                    worst_interval = (y1, y2)
             
-        print(f"   🔍 Analyse de {len(muni_list)} villes dans {state_name}...")
-        
-        # Barre de progression par état
-        for name in tqdm(muni_list, desc=f"Scan {state_name.split(',')[0]}", leave=False):
-            score = analyze_municipality(geo, name, args, is_deep_scan=False)
-            
-            # On garde le score s'il est pertinent
-            if score > 0:
-                global_scores[name] = score
-                # Affichage dynamique des "gros" cas
-                if score > 2.0:
-                    tqdm.write(f"      ⚠️  Alert: {name} -> Score: {score:.2f}")
+            row["Max_Score"] = round(max_city_score, 2)
+            row["Worst_Year"] = f"{worst_interval[0]}-{worst_interval[1]}" if worst_interval else "N/A"
+            results_data.append(row)
 
-    # --- RÉSULTATS GLOBAUX ---
-    sorted_scores = sorted(global_scores.items(), key=lambda x: x[1], reverse=True)
-    
-    print("\n" + "="*60)
-    print(f"🏆 CLASSEMENT NATIONAL (TOP 20) - Score de changement")
-    print("="*60)
-    for i, (name, score) in enumerate(sorted_scores[:20]):
-        print(f"{i+1}. {name:<30} : {score:.2f}")
+            # Si le score est significatif, on l'ajoute aux candidats pour le deep scan
+            if max_city_score > 0.2:
+                critical_cases.append({
+                    "name": city,
+                    "year_start": worst_interval[0],
+                    "year_end": worst_interval[1],
+                    "score": max_city_score
+                })
+                pbar.set_postfix({"Pire": f"{max_city_score:.1f}% ({worst_interval[0]})"})
 
-    # --- DEEP SCAN FINAL ---
+    # --- EXPORT EXCEL ---
+    print("\n💾 Génération du fichier Excel...")
+    df = pd.DataFrame(results_data, columns=columns)
+    df = df.sort_values(by="Max_Score", ascending=False) # Les pires en premier
+    df.to_excel("deforestation_report.xlsx", index=False)
+    print("✅ Rapport sauvegardé : deforestation_report.xlsx")
+
+    # --- DEEP SCAN SUR LES PIRES CAS ---
     print("\n" + "="*60)
-    print(f"🔬 GÉNÉRATION DES RAPPORTS DÉTAILLÉS (TOP {args.top_n})")
+    print(f"🔬 ANALYSE DÉTAILLÉE DES {args.top_n} PIRES CAS")
     print("="*60)
     
-    for name, score in sorted_scores[:args.top_n]:
-        analyze_municipality(geo, name, args, is_deep_scan=True)
+    # On trie les cas critiques par score
+    critical_cases.sort(key=lambda x: x["score"], reverse=True)
     
-    print(f"\n✅ Analyse terminée. Voir le dossier 'results/'.")
+    # On prend le top N
+    for case in critical_cases[:args.top_n]:
+        print(f"👉 {case['name']} : Pic en {case['year_start']}-{case['year_end']} (Score: {case['score']:.2f})")
+        analyze_municipality_year(
+            geo, 
+            case['name'], 
+            case['year_start'], 
+            case['year_end'], 
+            args, 
+            is_deep_scan=True
+        )
+
+    print("\n✅ Mission Terminée.")
 
 if __name__ == "__main__":
     main()

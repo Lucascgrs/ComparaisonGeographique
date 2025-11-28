@@ -27,9 +27,38 @@ except ImportError:
 # CONSTANTES
 # ============================================================================
 BRAZIL_STATES = [
-    "Pará, Brazil", "Mato Grosso, Brazil", "Rondônia, Brazil", 
-    "Amazonas, Brazil", "Acre, Brazil", "Maranhão, Brazil", 
-    "Roraima, Brazil", "Tocantins, Brazil", "Amapá, Brazil"
+    # --- Priorité 1 : Amazonie (Le front de déforestation) ---
+    "Pará, Brazil", 
+    "Mato Grosso, Brazil", 
+    "Rondônia, Brazil", 
+    "Amazonas, Brazil", 
+    "Acre, Brazil", 
+    "Maranhão, Brazil", 
+    "Roraima, Brazil", 
+    "Tocantins, Brazil", 
+    "Amapá, Brazil",
+
+    # --- Priorité 2 : Le Cerrado & Centre (Agriculture intensive) ---
+    "Goiás, Brazil", 
+    "Mato Grosso do Sul, Brazil", 
+    "Piauí, Brazil", 
+    "Bahia, Brazil", 
+    "Minas Gerais, Brazil", 
+    "Distrito Federal, Brazil",
+
+    # --- Priorité 3 : Sud & Côte (Zones déjà très urbanisées/agricoles) ---
+    "São Paulo, Brazil", 
+    "Paraná, Brazil", 
+    "Rio Grande do Sul, Brazil", 
+    "Santa Catarina, Brazil", 
+    "Ceará, Brazil", 
+    "Rio de Janeiro, Brazil", 
+    "Pernambuco, Brazil", 
+    "Espírito Santo, Brazil", 
+    "Paraíba, Brazil", 
+    "Rio Grande do Norte, Brazil", 
+    "Alagoas, Brazil", 
+    "Sergipe, Brazil"
 ]
 
 # ============================================================================
@@ -54,59 +83,69 @@ class GeoManager:
             "Mato Grosso": 51, "Goiás": 52, "Distrito Federal": 53
         }
 
-    def get_municipalities_list(self, state_full_name, limit=None):
-        """Récupère la liste via l'API IBGE (Version Tolérante)"""
+    def get_municipalities_list(self, state_full_name, limit=None, min_area_km2=2000):
+        """Récupération IBGE : Stratégie Hybride (Carte + Noms)"""
         state_name = state_full_name.split(",")[0].strip()
         tqdm.write(f"🌍 Récupération IBGE pour : {state_name}...")
-        
+
         code = self.ibge_codes.get(state_name)
         if not code: return []
 
         try:
-            url = f"https://servicodados.ibge.gov.br/api/v2/malhas/{code}/?resolucao=5&formato=application/vnd.geo+json"
             headers = {'User-Agent': 'Mozilla/5.0'}
-            r = requests.get(url, headers=headers)
-            r.raise_for_status()
-            
-            from io import BytesIO
-            gdf = gpd.read_file(BytesIO(r.content))
-            
-            # DEBUG : Afficher les colonnes reçues si ça plante
-            # print(f"DEBUG Colonnes reçues : {gdf.columns.tolist()}")
-            
-            # Logique floue pour trouver le nom de la ville
-            col_name = None
-            candidates = ['NM_MUN', 'name', 'nam', 'nom', 'nome', 'municipio']
-            
-            # 1. On cherche une colonne connue
-            for c in candidates:
-                if c in gdf.columns:
-                    col_name = c
-                    break
-            
-            # 2. Si on trouve pas, on prend la première colonne de type 'object' (texte) qui n'est pas 'geometry'
-            if not col_name:
-                for col in gdf.columns:
-                    if col != 'geometry' and gdf[col].dtype == 'object':
-                        col_name = col
-                        break
-            
-            if not col_name:
-                tqdm.write(f"❌ Impossible de trouver la colonne 'Nom de ville' dans : {gdf.columns.tolist()}")
-                return []
 
-            # On renomme la colonne trouvée en 'name' pour tout le reste du script
-            gdf['name'] = gdf[col_name].astype(str) + ", Brazil"
-            
-            if limit and limit > 0: 
+            # ÉTAPE 1 : Télécharger la CARTE (Géométries + Codes)
+            url_geo = f"https://servicodados.ibge.gov.br/api/v3/malhas/estados/{code}?formato=application/vnd.geo+json&qualidade=minima&intrarregiao=municipio"
+            r_geo = requests.get(url_geo, headers=headers)
+            r_geo.raise_for_status()
+
+            from io import BytesIO
+            gdf = gpd.read_file(BytesIO(r_geo.content))
+
+            # ÉTAPE 2 : Télécharger les NOMS (Métadonnées)
+            # On récupère la liste de tous les municipes de l'état avec leurs noms et codes
+            url_names = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{code}/municipios"
+            r_names = requests.get(url_names, headers=headers)
+            r_names.raise_for_status()
+            names_data = r_names.json()  # C'est une liste de dicts [{'id': 1500107, 'nome': 'Abaetetuba'...}]
+
+            # Création d'un dictionnaire de mapping : Code -> Nom
+            # Attention : codarea dans le GeoJSON est souvent un string, id dans le JSON est un int
+            # On convertit tout en string pour être sûr
+            code_to_name = {str(item['id']): item['nome'] for item in names_data}
+
+            # ÉTAPE 3 : FUSION (Jointure)
+            # La colonne code s'appelle souvent 'codarea' ou 'CD_MUN'
+            geo_col = 'codarea' if 'codarea' in gdf.columns else gdf.columns[0]  # On prend la 1ere si on trouve pas
+
+            # On crée la colonne 'name' en mappant
+            # On prend les 7 premiers chiffres du code (parfois le code geo a un suffixe)
+            gdf['clean_code'] = gdf[geo_col].astype(str).str.slice(0, 7)
+            gdf['name_only'] = gdf['clean_code'].map(code_to_name)
+
+            # Nettoyage : On vire ceux qu'on a pas trouvés (rare)
+            gdf = gdf.dropna(subset=['name_only'])
+            gdf['name'] = gdf['name_only'] + ", Brazil"
+
+            # ÉTAPE 4 : SURFACE & FILTRE
+            gdf_area = gdf.to_crs("EPSG:5880")
+            gdf['area_km2'] = gdf_area.geometry.area / 10 ** 6
+
+            gdf = gdf[gdf['area_km2'] >= min_area_km2]
+            gdf = gdf.sort_values(by='area_km2', ascending=False)
+
+            tqdm.write(f"✅ {len(gdf)} villes chargées (Fusion Carte+Noms réussie).")
+
+            if limit and limit > 0:
                 gdf = gdf.head(limit)
-            
+
             self.municipalities = gdf
-            tqdm.write(f"✅ {len(gdf)} municipalités chargées.")
             return gdf['name'].tolist()
-            
+
         except Exception as e:
-            tqdm.write(f"❌ Erreur IBGE : {e}")
+            tqdm.write(f"❌ Erreur Stratégie Hybride : {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def set_current_municipality(self, name):
@@ -270,12 +309,13 @@ def analyze_municipality_year(geo, name, year_start, year_end, args, is_deep_sca
 def main():
     parser = argparse.ArgumentParser(description="Time Machine Déforestation")
     parser.add_argument("--max_states", type=int, default=1)
-    parser.add_argument("--limit_per_state", type=int, default=1)
-    parser.add_argument("--top_n", type=int, default=1, help="Nombre de cas critiques à générer")
-    parser.add_argument("--start_year", type=int, default=2021)
-    parser.add_argument("--end_year", type=int, default=2022)
-    parser.add_argument("--scan_resolution", type=int, default=1000)
+    parser.add_argument("--limit_per_state", type=int, default=3)
+    parser.add_argument("--top_n", type=int, default=80, help="Nombre de cas critiques à générer")
+    parser.add_argument("--start_year", type=int, default=2017)
+    parser.add_argument("--end_year", type=int, default=2024)
+    parser.add_argument("--scan_resolution", type=int, default=400)
     parser.add_argument("--resolution", type=int, default=210)
+    parser.add_argument("--min_area", type=int, default=5000, help="Surface minimale en km² pour analyser une municipalité")
     args = parser.parse_args()
 
     # Génération des intervalles (ex: 2018-2019, 2019-2020...)
@@ -292,7 +332,7 @@ def main():
     print(f"📊 États: {len(states)} | Intervalles: {len(years_intervals)}")
 
     for state in states:
-        cities = geo.get_municipalities_list(state, limit=args.limit_per_state)
+        cities = geo.get_municipalities_list(state, limit=args.limit_per_state, min_area_km2=args.min_area)
         if not cities: continue
 
         # Barre de progression des villes
